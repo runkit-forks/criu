@@ -320,8 +320,9 @@ def wait_pid_die(pid, who, tmo = 30):
 	while stime < tmo:
 		try:
 			os.kill(int(pid), 0)
-		except Exception, e:
-			print "Unable to kill %d: %s" % (pid, e)
+		except OSError, e:
+			if e.errno != errno.ESRCH:
+				print e
 			break
 
 		print "Wait for %s(%d) to die for %f" % (who, pid, stime)

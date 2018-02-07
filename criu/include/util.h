@@ -37,6 +37,8 @@
 struct vma_area;
 struct list_head;
 
+extern int service_fd_rlim_cur;
+
 extern void pr_vma(unsigned int loglevel, const struct vma_area *vma_area);
 
 #define pr_info_vma(vma_area)	pr_vma(LOG_INFO, vma_area)
@@ -351,6 +353,11 @@ extern int epoll_prepare(int nr_events, struct epoll_event **evs);
 extern int open_fd_of_vpid(pid_t pid, int fd, int flags);
 
 extern int call_in_child_process(int (*fn)(void *), void *arg);
+#ifdef __GLIBC__
+extern void print_stack_trace(pid_t pid);
+#else
+static inline void print_stack_trace(pid_t pid) {}
+#endif
 
 #define block_sigmask(saved_mask, sig_mask)	({					\
 		sigset_t ___blocked_mask;						\

@@ -384,6 +384,10 @@ static int root_prepare_shared(void)
 	if (ret)
 		goto err;
 
+	ret = add_fake_unix_queuers();
+	if (ret)
+		goto err;
+
 	show_saved_files();
 err:
 	return ret;
@@ -509,6 +513,32 @@ static int setup_child_task_namespaces(struct pstree_item *item, struct ns_id **
 
 	*ret_pid_ns = pid_ns;
 
+	return 0;
+}
+
+/* This actually populates and occupies ROOT_FD_OFF sfd */
+static int populate_root_fd_off(void)
+{
+	struct ns_id *mntns = NULL;
+	int ret;
+
+        if (root_ns_mask & CLONE_NEWNS) {
+                mntns = lookup_ns_by_id(root_item->ids->mnt_ns_id, &mnt_ns_desc);
+                BUG_ON(!mntns);
+        }
+
+	ret = mntns_get_root_fd(mntns);
+	if (ret < 0)
+		pr_err("Can't get root fd\n");
+	return ret >= 0 ? 0 : -1;
+}
+
+static int populate_pid_proc(void)
+{
+	if (open_pid_proc(vpid(current)) < 0) {
+		pr_err("Can't open PROC_SELF\n");
+		return -1;
+	}
 	return 0;
 }
 
@@ -1111,11 +1141,16 @@ static int wait_on_helpers_zombies(void)
 	return 0;
 }
 
+static int wait_exiting_children(void);
+
 static int restore_one_zombie(CoreEntry *core)
 {
 	int exit_code = core->tc->exit_code;
 
 	pr_info("Restoring zombie with %d code\n", exit_code);
+
+	if (prepare_fds(current))
+		return -1;
 
 	if (inherit_fd_fini() < 0)
 		return -1;
@@ -1126,7 +1161,7 @@ static int restore_one_zombie(CoreEntry *core)
 	prctl(PR_SET_NAME, (long)(void *)core->tc->comm, 0, 0, 0);
 
 	if (task_entries != NULL) {
-		restore_finish_stage(task_entries, CR_STATE_RESTORE);
+		wait_exiting_children();
 		zombie_prepare_signals();
 	}
 
@@ -1158,7 +1193,7 @@ static int restore_one_zombie(CoreEntry *core)
 
 static int setup_newborn_fds(struct pstree_item *me)
 {
-	if (clone_service_fd(rsti(me)->service_fd_id))
+	if (clone_service_fd(me))
 		return -1;
 
 	if (!me->parent ||
@@ -1173,9 +1208,6 @@ static int setup_newborn_fds(struct pstree_item *me)
 		if (close_old_fds())
 			return -1;
 	}
-
-	if (log_init_by_pid(vpid(me)))
-		return -1;
 
 	return 0;
 }
@@ -1230,20 +1262,9 @@ static bool child_death_expected(void)
 	return false;
 }
 
-/*
- * Restore a helper process - artificially created by criu
- * to restore attributes of process tree.
- * - sessions for each leaders are dead
- * - process groups with dead leaders
- * - dead tasks for which /proc/<pid>/... is opened by restoring task
- * - whatnot
- */
-static int restore_one_helper(void)
+static int wait_exiting_children(void)
 {
 	siginfo_t info;
-
-	if (prepare_fds(current))
-		return -1;
 
 	if (!child_death_expected()) {
 		/*
@@ -1287,6 +1308,22 @@ static int restore_one_helper(void)
 	return 0;
 }
 
+/*
+ * Restore a helper process - artificially created by criu
+ * to restore attributes of process tree.
+ * - sessions for each leaders are dead
+ * - process groups with dead leaders
+ * - dead tasks for which /proc/<pid>/... is opened by restoring task
+ * - whatnot
+ */
+static int restore_one_helper(void)
+{
+	if (prepare_fds(current))
+		return -1;
+
+	return wait_exiting_children();
+}
+
 static int restore_one_task(int pid, CoreEntry *core)
 {
 	int i, ret;
@@ -1299,6 +1336,7 @@ static int restore_one_task(int pid, CoreEntry *core)
 		ret = restore_one_zombie(core);
 	else if (current->pid->state == TASK_HELPER) {
 		ret = restore_one_helper();
+		sfds_protected = false;
 		close_image_dir();
 		close_proc();
 		for (i = SERVICE_FD_MIN + 1; i < SERVICE_FD_MAX; i++)
@@ -1778,9 +1816,6 @@ static int restore_task_with_children(void *_arg)
 	if (current->pid->real < 0)
 		goto err;
 
-	if (setup_newborn_fds(current))
-		goto err;
-
 	pid = getpid();
 	if (last_level_pid(current->pid) != pid) {
 		pr_err("Pid %d do not match expected %d (task %d)\n",
@@ -1788,6 +1823,9 @@ static int restore_task_with_children(void *_arg)
 		set_task_cr_err(EEXIST);
 		goto err;
 	}
+
+	if (log_init_by_pid(vpid(current)))
+		return -1;
 
 	if (current->parent == NULL) {
 		/*
@@ -1853,7 +1891,13 @@ static int restore_task_with_children(void *_arg)
 
 		if (root_prepare_shared())
 			goto err;
+
+		if (populate_root_fd_off())
+			goto err;
 	}
+
+	if (setup_newborn_fds(current))
+		goto err;
 
 	if ((ca->clone_flags & CLONE_NEWPID) && setup_current_pid_ns())
 		goto err;
@@ -1881,6 +1925,11 @@ static int restore_task_with_children(void *_arg)
 		goto err;
 
 	timing_stop(TIME_FORK);
+
+	if (populate_pid_proc())
+		goto err;
+
+	sfds_protected = true;
 
 	if (unmap_guard_pages(current))
 		goto err;
@@ -2192,9 +2241,6 @@ static int restore_root_task(struct pstree_item *init)
 	}
 
 	if (prepare_userns_hook())
-		return -1;
-
-	if (fdstore_init())
 		return -1;
 
 	if (prepare_namespace_before_tasks())
@@ -2521,6 +2567,9 @@ int cr_restore_tasks(void)
 		goto err;
 
 	if (prepare_pstree() < 0)
+		goto err;
+
+	if (fdstore_init())
 		goto err;
 
 	if (crtools_prepare_shared() < 0)
@@ -3720,6 +3769,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	if (restore_fs(current))
 		goto err;
 
+	sfds_protected = false;
 	close_image_dir();
 	close_proc();
 	close_service_fd(CR_PROC_FD_OFF);

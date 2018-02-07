@@ -296,7 +296,7 @@ static pid_t open_proc_pid = PROC_NONE;
 static pid_t open_proc_self_pid;
 static int open_proc_self_fd = -1;
 
-static inline void set_proc_self_fd(int fd)
+void set_proc_self_fd(int fd)
 {
 	if (open_proc_self_fd >= 0)
 		close(open_proc_self_fd);
@@ -434,7 +434,11 @@ int do_open_proc(pid_t pid, int flags, const char *fmt, ...)
 	return openat(dirfd, path, flags);
 }
 
-static int service_fd_rlim_cur;
+/* Max potentially possible fd to be open by criu process */
+int service_fd_rlim_cur;
+/* Base of current process service fds set */
+static int service_fd_base;
+/* Id of current process in shared fdt */
 static int service_fd_id = 0;
 
 int init_service_fd(void)
@@ -452,14 +456,15 @@ int init_service_fd(void)
 	}
 
 	service_fd_rlim_cur = (int)rlimit.rlim_cur;
-	BUG_ON(service_fd_rlim_cur < SERVICE_FD_MAX);
+	service_fd_base = service_fd_rlim_cur;
+	BUG_ON(service_fd_base < SERVICE_FD_MAX);
 
 	return 0;
 }
 
 static int __get_service_fd(enum sfd_type type, int service_fd_id)
 {
-	return service_fd_rlim_cur - type - SERVICE_FD_MAX * service_fd_id;
+	return service_fd_base - type - SERVICE_FD_MAX * service_fd_id;
 }
 
 int service_fd_min_fd(struct pstree_item *item)
@@ -473,15 +478,18 @@ int service_fd_min_fd(struct pstree_item *item)
 }
 
 static DECLARE_BITMAP(sfd_map, SERVICE_FD_MAX);
+/*
+ * Variable for marking areas of code, where service fds modifications
+ * are prohibited. It's used to safe them from reusing their numbers
+ * by ordinary files. See install_service_fd() and close_service_fd().
+ */
+bool sfds_protected = false;
 
-int reserve_service_fd(enum sfd_type type)
+static void sfds_protection_bug(enum sfd_type type)
 {
-	int sfd = __get_service_fd(type, service_fd_id);
-
-	BUG_ON((int)type <= SERVICE_FD_MIN || (int)type >= SERVICE_FD_MAX);
-
-	set_bit(type, sfd_map);
-	return sfd;
+	pr_err("Service fd %u is being modified in protected context\n", type);
+	print_stack_trace(current ? vpid(current) : 0);
+	BUG();
 }
 
 int install_service_fd(enum sfd_type type, int fd)
@@ -489,6 +497,8 @@ int install_service_fd(enum sfd_type type, int fd)
 	int sfd = __get_service_fd(type, service_fd_id);
 
 	BUG_ON((int)type <= SERVICE_FD_MIN || (int)type >= SERVICE_FD_MAX);
+	if (sfds_protected && !test_bit(type, sfd_map))
+		sfds_protection_bug(type);
 
 	if (dup3(fd, sfd, O_CLOEXEC) != sfd) {
 		pr_perror("Dup %d -> %d failed", fd, sfd);
@@ -518,6 +528,9 @@ int close_service_fd(enum sfd_type type)
 {
 	int fd;
 
+	if (sfds_protected)
+		sfds_protection_bug(type);
+
 	fd = get_service_fd(type);
 	if (fd < 0)
 		return 0;
@@ -529,27 +542,89 @@ int close_service_fd(enum sfd_type type)
 	return 0;
 }
 
-int clone_service_fd(int id)
+static void move_service_fd(struct pstree_item *me, int type, int new_id, int new_base)
 {
-	int ret = -1, i;
+	int old = get_service_fd(type);
+	int new = new_base - type - SERVICE_FD_MAX * new_id;
+	int ret;
 
-	if (service_fd_id == id)
-		return 0;
-
-	for (i = SERVICE_FD_MIN + 1; i < SERVICE_FD_MAX; i++) {
-		int old = get_service_fd(i);
-		int new = __get_service_fd(i, id);
-
-		if (old < 0)
-			continue;
-		ret = dup2(old, new);
-		if (ret == -1) {
-			if (errno == EBADF)
-				continue;
+	if (old < 0)
+		return;
+	ret = dup2(old, new);
+	if (ret == -1) {
+		if (errno != EBADF)
 			pr_perror("Unable to clone %d->%d", old, new);
+	} else if (!(rsti(me)->clone_flags & CLONE_FILES))
+		close(old);
+}
+
+static int choose_service_fd_base(struct pstree_item *me)
+{
+	int nr, real_nr, fdt_nr = 1, id = rsti(me)->service_fd_id;
+
+	if (rsti(me)->fdt) {
+		/* The base is set by owner of fdt (id 0) */
+		if (id != 0)
+			return service_fd_base;
+		fdt_nr = rsti(me)->fdt->nr;
+	}
+	/* Now find process's max used fd number */
+	if (!list_empty(&rsti(me)->fds))
+		nr = list_entry(rsti(me)->fds.prev,
+				struct fdinfo_list_entry, ps_list)->fe->fd;
+	else
+		nr = -1;
+
+	nr = max(nr, inh_fd_max);
+	/*
+	 * Service fds go after max fd near right border of alignment:
+	 *
+	 * ...|max_fd|max_fd+1|...|sfd first|...|sfd last (aligned)|
+	 *
+	 * So, they take maximum numbers of area allocated by kernel.
+	 * See linux alloc_fdtable() for details.
+	 */
+	nr += (SERVICE_FD_MAX - SERVICE_FD_MIN) * fdt_nr;
+	nr += 16; /* Safety pad */
+	real_nr = nr;
+
+	nr /= (1024 / sizeof(void *));
+	nr = 1 << (32 - __builtin_clz(nr));
+	nr *= (1024 / sizeof(void *));
+
+	if (nr > service_fd_rlim_cur) {
+		/* Right border is bigger, than rlim. OK, then just aligned value is enough */
+		nr = round_down(service_fd_rlim_cur, (1024 / sizeof(void *)));
+		if (nr < real_nr) {
+			pr_err("Can't chose service_fd_base: %d %d\n", nr, real_nr);
+			return -1;
 		}
 	}
 
+	return nr;
+}
+
+int clone_service_fd(struct pstree_item *me)
+{
+	int id, new_base, i, ret = -1;
+
+	new_base = choose_service_fd_base(me);
+	id = rsti(me)->service_fd_id;
+
+	if (new_base == -1)
+		return -1;
+	if (service_fd_base == new_base && service_fd_id == id)
+		return 0;
+
+	/* Dup sfds in memmove() style: they may overlap */
+	if (get_service_fd(LOG_FD_OFF) > new_base - LOG_FD_OFF - SERVICE_FD_MAX * id)
+		for (i = SERVICE_FD_MIN + 1; i < SERVICE_FD_MAX; i++)
+			move_service_fd(me, i, id, new_base);
+	else
+		for (i = SERVICE_FD_MAX - 1; i > SERVICE_FD_MIN; i--)
+			move_service_fd(me, i, id, new_base);
+
+	service_fd_base = new_base;
 	service_fd_id = id;
 	ret = 0;
 
@@ -1200,7 +1275,7 @@ static int get_sockaddr_in(struct sockaddr_in *addr, char *host)
 		return -1;
 	}
 
-	addr->sin_port = opts.port;
+	addr->sin_port = htons(opts.port);
 	return 0;
 }
 
@@ -1210,7 +1285,7 @@ int setup_tcp_server(char *type)
 	struct sockaddr_in saddr;
 	socklen_t slen = sizeof(saddr);
 
-	pr_info("Starting %s server on port %u\n", type, (int)ntohs(opts.port));
+	pr_info("Starting %s server on port %u\n", type, opts.port);
 
 	sk = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (sk < 0) {
@@ -1300,7 +1375,7 @@ int setup_tcp_client(char *addr)
 	struct sockaddr_in saddr;
 	int sk;
 
-	pr_info("Connecting to server %s:%u\n", addr, (int)ntohs(opts.port));
+	pr_info("Connecting to server %s:%u\n", addr, opts.port);
 
 	if (get_sockaddr_in(&saddr, addr))
 		return -1;
@@ -1496,6 +1571,24 @@ out:
 	close_pid_proc();
 	return ret;
 }
+
+#ifdef __GLIBC__
+#include <execinfo.h>
+void print_stack_trace(pid_t pid)
+{
+	void *array[10];
+	char **strings;
+	size_t size, i;
+
+	size = backtrace(array, 10);
+	strings = backtrace_symbols(array, size);
+
+	for (i = 0; i < size; i++)
+		pr_err("stack %d#%zu: %s\n", pid, i, strings[i]);
+
+	free(strings);
+}
+#endif
 
 /*
  * In glibc 2.24, getpid() returns a parent PID, if a child was

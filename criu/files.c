@@ -57,6 +57,8 @@ static struct hlist_head file_desc_hash[FDESC_HASH_SIZE];
 /* file_desc's, which fle is not owned by a process, that is able to open them */
 static LIST_HEAD(fake_master_head);
 
+static u32 max_file_desc_id = 0;
+
 static void init_fdesc_hash(void)
 {
 	int i;
@@ -91,6 +93,10 @@ int file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops)
 		if (d->setns_userns)
 			list_add(&d->fake_master_list, &fake_master_head);
 	}
+
+	if (id > max_file_desc_id)
+		max_file_desc_id = id;
+
 	return 0; /* this is to make tail-calls in collect_one_foo look nice */
 }
 
@@ -118,6 +124,11 @@ struct file_desc *find_file_desc_raw(int type, u32 id)
 static inline struct file_desc *find_file_desc(FdinfoEntry *fe)
 {
 	return find_file_desc_raw(fe->type, fe->id);
+}
+
+u32 find_unused_file_desc_id(void)
+{
+	return max_file_desc_id + 1;
 }
 
 struct fdinfo_list_entry *find_used_fd(struct pstree_item *task, int fd)
@@ -772,13 +783,11 @@ static struct fdinfo_list_entry *alloc_fle(int pid, FdinfoEntry *fe)
 	return fle;
 }
 
-static void collect_desc_fle(struct fdinfo_list_entry *new_le, struct file_desc *fdesc)
+static void __collect_desc_fle(struct fdinfo_list_entry *new_le, struct file_desc *fdesc)
 {
 	struct fdinfo_list_entry *le;
 	struct ns_id *task_ns = NULL;
 	bool first = true;
-
-	new_le->desc = fdesc;
 
 	/*
 	 * First fle in fdesc->fd_info_head list (i.e., master)
@@ -821,15 +830,29 @@ compare_pid:
 	list_add_tail(&new_le->desc_list, &le->desc_list);
 }
 
+static void collect_desc_fle(struct fdinfo_list_entry *new_le,
+			     struct file_desc *fdesc, bool force_master)
+{
+	new_le->desc = fdesc;
+
+	if (!force_master)
+		__collect_desc_fle(new_le, fdesc);
+	else {
+		/* Link as first entry */
+		list_add(&new_le->desc_list, &fdesc->fd_info_head);
+	}
+}
+
 struct fdinfo_list_entry *collect_fd_to(int pid, FdinfoEntry *e,
-		struct rst_info *rst_info, struct file_desc *fdesc, bool fake)
+		struct rst_info *rst_info, struct file_desc *fdesc,
+		bool fake, bool force_master)
 {
 	struct fdinfo_list_entry *new_le;
 
 	new_le = alloc_fle(pid, e);
 	if (new_le) {
 		new_le->fake = (!!fake);
-		collect_desc_fle(new_le, fdesc);
+		collect_desc_fle(new_le, fdesc, force_master);
 		collect_task_fd(new_le, rst_info);
 	}
 
@@ -849,7 +872,7 @@ int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info, bool fake)
 		return -1;
 	}
 
-	if (!collect_fd_to(pid, e, rst_info, fdesc, fake))
+	if (!collect_fd_to(pid, e, rst_info, fdesc, fake, false))
 		return -1;
 
 	return 0;
@@ -882,33 +905,6 @@ int dup_fle(struct pstree_item *task, struct fdinfo_list_entry *ple,
 		return -1;
 
 	return collect_fd(vpid(task), e, rsti(task), false);
-}
-
-int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id)
-{
-	FdinfoEntry *e;
-
-	if (!ctl_tty_id)
-		return 0;
-
-	pr_info("Requesting for ctl tty %#x into service fd\n", ctl_tty_id);
-
-	e = xmalloc(sizeof(*e));
-	if (!e)
-		return -1;
-
-	fdinfo_entry__init(e);
-
-	e->id		= ctl_tty_id;
-	e->fd		= reserve_service_fd(CTL_TTY_OFF);
-	e->type		= FD_TYPES__TTY;
-
-	if (collect_fd(pid, e, rst_info, false)) {
-		xfree(e);
-		return -1;
-	}
-
-	return 0;
 }
 
 int prepare_fd_pid(struct pstree_item *item)
@@ -1133,7 +1129,7 @@ out:
 	return ret;
 }
 
-static int setup_and_serve_out(struct fdinfo_list_entry *fle, int new_fd)
+int setup_and_serve_out(struct fdinfo_list_entry *fle, int new_fd)
 {
 	struct file_desc *d = fle->desc;
 	pid_t pid = fle->pid;
@@ -1166,7 +1162,7 @@ static int open_fd(struct fdinfo_list_entry *fle)
 		ret = receive_fd(fle);
 		if (ret != 0)
 			return ret;
-		goto fixup_ctty;
+		goto out;
 	}
 
 	/*
@@ -1187,16 +1183,9 @@ static int open_fd(struct fdinfo_list_entry *fle)
 		if (setup_and_serve_out(fle, new_fd) < 0)
 			return -1;
 	}
-fixup_ctty:
-	if (ret == 0) {
-		if (fle->fe->fd == get_service_fd(CTL_TTY_OFF)) {
-			ret = tty_restore_ctl_terminal(fle->desc, fle->fe->fd);
-			if (ret == -1)
-				return ret;
-		}
-
+out:
+	if (ret == 0)
 		fle->stage = FLE_RESTORED;
-	}
 	return ret;
 }
 
@@ -1330,8 +1319,10 @@ int prepare_fds(struct pstree_item *me)
 	 * correct /tasks file if it is in a different cgroup
 	 * set than its parent
 	 */
+	sfds_protected = false;
 	close_service_fd(CGROUP_YARD);
-	close_pid_proc(); /* flush any proc cached fds we may have */
+	sfds_protected = true;
+	set_proc_self_fd(-1); /* flush any proc cached fds we may have */
 
 	if (rsti(me)->fdt) {
 		struct fdt *fdt = rsti(me)->fdt;
@@ -1357,7 +1348,6 @@ int prepare_fds(struct pstree_item *me)
 	if (rsti(me)->fdt)
 		futex_inc_and_wake(&rsti(me)->fdt->fdt_lock);
 out:
-	tty_fini_fds();
 	return ret;
 }
 
@@ -1537,6 +1527,8 @@ struct inherit_fd {
 	dev_t inh_rdev;
 };
 
+int inh_fd_max = -1;
+
 /*
  * Return 1 if inherit fd has been closed or reused, 0 otherwise.
  *
@@ -1632,6 +1624,9 @@ int inherit_fd_add(int fd, char *key)
 	inh = xmalloc(sizeof *inh);
 	if (inh == NULL)
 		return -1;
+
+	if (fd > inh_fd_max)
+		inh_fd_max = fd;
 
 	inh->inh_id = key;
 	inh->inh_fd = fd;

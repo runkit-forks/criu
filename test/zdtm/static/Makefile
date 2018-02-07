@@ -10,6 +10,7 @@ TST_NOFILE	:=				\
 		caps00				\
 		wait00				\
 		zombie00			\
+		zombie01			\
 		fpu00				\
 		fpu01				\
 		arm-neon00			\
@@ -171,9 +172,12 @@ TST_NOFILE	:=				\
 		scm02				\
 		scm03				\
 		scm04				\
+		scm05				\
+		scm06				\
 		aio00				\
 		aio01				\
 		fd				\
+		fd01				\
 		apparmor				\
 		seccomp_strict			\
 		seccomp_filter			\
@@ -316,6 +320,7 @@ TST_DIR		=				\
 		mntns_open			\
 		mntns_link_remap		\
 		mntns_ghost			\
+		mntns_ghost01			\
 		mntns_ro_root			\
 		mntns_link_ghost		\
 		mntns_shared_bind		\

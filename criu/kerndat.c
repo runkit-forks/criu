@@ -197,7 +197,7 @@ int kerndat_files_stat(bool early)
 				buf[ret] = '\0';
 				max_files = atol(buf);
 			}
-			ret = read(fd2, buf, sizeof(buf));
+			ret = read(fd2, buf, sizeof(buf) - 1);
 			if (ret > 0) {
 				buf[ret] = '\0';
 				nr_open = atol(buf);
@@ -1035,6 +1035,8 @@ int kerndat_init(void)
 		ret = kerndat_socket_netns();
 	if (!ret)
 		ret = kerndat_nsid();
+	if (!ret)
+		ret = kerndat_link_nsid();
 	if (!ret)
 		ret = kerndat_has_memfd_create();
 	if (!ret)
