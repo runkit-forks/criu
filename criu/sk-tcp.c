@@ -408,6 +408,9 @@ int prepare_tcp_socks(struct task_restore_args *ta)
 
 int restore_one_tcp(int fd, struct inet_sk_info *ii)
 {
+	// skip restoring tcp connections
+	return 0;
+
 	struct libsoccr_sk *sk;
 
 	pr_info("Restoring TCP connection\n");
