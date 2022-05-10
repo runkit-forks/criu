@@ -483,6 +483,8 @@ static int collect_remap_ghost(struct reg_file_info *rfi, RemapFilePathEntry *rp
 {
 	struct ghost_file *gf;
 
+	pr_info("Searching for ghost file %#x for %s\n", rpe->remap_id, rfi->path);
+
 	list_for_each_entry(gf, &ghost_files, list)
 		if (gf->id == rpe->remap_id)
 			goto gf_found;
