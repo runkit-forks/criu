@@ -449,6 +449,8 @@ int restore_one_tcp(int fd, struct inet_sk_info *ii)
 {
 	struct libsoccr_sk *sk;
 
+	return 0;
+
 	pr_info("Restoring TCP connection\n");
 
 	if (opts.tcp_close) {
