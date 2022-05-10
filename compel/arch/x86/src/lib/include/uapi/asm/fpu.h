@@ -8,6 +8,7 @@
 #include <compel/common/compiler.h>
 
 #define FP_MIN_ALIGN_BYTES		64
+#define FXSAVE_ALIGN_BYTES		16
 
 #define FP_XSTATE_MAGIC1		0x46505853U
 #define FP_XSTATE_MAGIC2		0x46505845U
